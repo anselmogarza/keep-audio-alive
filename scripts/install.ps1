@@ -25,8 +25,14 @@ $shortcut.WorkingDirectory = $installDir
 $shortcut.Description = 'Keep Audio Alive'
 $shortcut.Save()
 
+# Register autostart on login (per-user Run key, no admin needed). Points at the
+# installed exe and matches the value the app's own "Start with Windows" toggle
+# writes, so the tray menu shows it as already enabled. uninstall.ps1 removes it.
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+Set-ItemProperty -Path $runKey -Name 'KeepAudioAlive' -Value "`"$targetExe`""
+
 Write-Host "Installed to $targetExe"
 Write-Host "Start Menu shortcut: $shortcutPath"
-Write-Host "Launch it, then use the tray menu's 'Start with Windows' to run it on login."
+Write-Host "Autostart on login: enabled (toggle anytime via the tray's 'Start with Windows')."
 
 Start-Process -FilePath $targetExe

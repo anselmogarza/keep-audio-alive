@@ -5,7 +5,6 @@ use std::time::Duration;
 
 const TONE_HZ: f32 = 50.0;
 const ONE_SHOT_DURATION: Duration = Duration::from_secs(3);
-const AMPLITUDE: f32 = 0.05;
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Names of every available output device, in enumeration order.
@@ -37,61 +36,75 @@ fn resolve_device(host: &cpal::Host, device_name: Option<&str>) -> Result<cpal::
     }
 }
 
-/// Plays a short, quiet 50Hz tone once on the named device (or the system
-/// default when `None`) and returns once it finishes.
-pub fn play_tone(device_name: Option<&str>) -> Result<(), String> {
-    with_tone_stream(device_name, |stream| {
-        stream.play().map_err(|e| e.to_string())?;
+/// Plays a short 50Hz tone once on the named device (or the system default
+/// when `None`) at `amplitude` (0.0–1.0) and returns once it finishes.
+pub fn play_tone(device_name: Option<&str>, amplitude: f32) -> Result<(), String> {
+    with_tone_stream(device_name, amplitude, || {
         std::thread::sleep(ONE_SHOT_DURATION);
         Ok(())
     })
 }
 
-/// Plays the 50Hz tone continuously (no gaps) until `stop_rx` receives
-/// anything or disconnects. Returns once playback has stopped.
-pub fn run_continuous(device_name: Option<&str>, stop_rx: &Receiver<()>) -> Result<(), String> {
-    with_tone_stream(device_name, |stream| {
-        stream.play().map_err(|e| e.to_string())?;
-        loop {
-            match stop_rx.recv_timeout(STOP_POLL_INTERVAL) {
-                Err(RecvTimeoutError::Timeout) => continue,
-                _ => return Ok(()),
-            }
+/// Plays the 50Hz tone continuously (no gaps) at `amplitude` (0.0–1.0) until
+/// `stop_rx` receives anything or disconnects. Returns once playback stops.
+pub fn run_continuous(
+    device_name: Option<&str>,
+    amplitude: f32,
+    stop_rx: &Receiver<()>,
+) -> Result<(), String> {
+    with_tone_stream(device_name, amplitude, || loop {
+        match stop_rx.recv_timeout(STOP_POLL_INTERVAL) {
+            Err(RecvTimeoutError::Timeout) => continue,
+            _ => return Ok(()),
         }
     })
 }
 
-fn with_tone_stream<F>(device_name: Option<&str>, body: F) -> Result<(), String>
+/// Opens the tone stream, starts it, forces this app's session to full volume,
+/// then runs `wait` until it returns. The stream stays alive (and audible) for
+/// the whole call and stops when it's dropped on return.
+fn with_tone_stream<F>(device_name: Option<&str>, amplitude: f32, wait: F) -> Result<(), String>
 where
-    F: FnOnce(&cpal::Stream) -> Result<(), String>,
+    F: FnOnce() -> Result<(), String>,
 {
     let host = cpal::default_host();
     let device = resolve_device(&host, device_name)?;
     let config = device.default_output_config().map_err(|e| e.to_string())?;
-    match config.sample_format() {
-        cpal::SampleFormat::F32 => run::<f32, F>(&device, config.into(), body),
-        cpal::SampleFormat::I16 => run::<i16, F>(&device, config.into(), body),
-        cpal::SampleFormat::U16 => run::<u16, F>(&device, config.into(), body),
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => build_stream::<f32>(&device, config.into(), amplitude),
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, config.into(), amplitude),
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, config.into(), amplitude),
         other => Err(format!("unsupported sample format: {other:?}")),
-    }
+    }?;
+
+    stream.play().map_err(|e| e.to_string())?;
+    // Playing creates this process's audio session; now pin it to 100% so the
+    // tone is at full level regardless of where the app sits in the mixer.
+    #[cfg(windows)]
+    crate::winvol::force_app_volume_max();
+
+    wait()
 }
 
-fn run<T, F>(device: &cpal::Device, config: cpal::StreamConfig, body: F) -> Result<(), String>
+fn build_stream<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    amplitude: f32,
+) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
-    F: FnOnce(&cpal::Stream) -> Result<(), String>,
 {
     let sample_rate = config.sample_rate as f32;
     let channels = config.channels as usize;
     let phase_step = TONE_HZ / sample_rate;
     let mut phase = 0f32;
 
-    let stream = device
+    device
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
                 for frame in data.chunks_mut(channels) {
-                    let sample = (phase * std::f32::consts::TAU).sin() * AMPLITUDE;
+                    let sample = (phase * std::f32::consts::TAU).sin() * amplitude;
                     phase = (phase + phase_step).fract();
                     let value = T::from_sample(sample);
                     for slot in frame.iter_mut() {
@@ -102,7 +115,5 @@ where
             |err| eprintln!("audio stream error: {err}"),
             None,
         )
-        .map_err(|e| e.to_string())?;
-
-    body(&stream)
+        .map_err(|e| e.to_string())
 }

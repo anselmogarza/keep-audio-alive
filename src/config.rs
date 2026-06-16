@@ -16,6 +16,21 @@ pub struct Settings {
     pub interval_secs: u64,
     /// `None` means "system default output device".
     pub device_name: Option<String>,
+    /// Tone loudness as a percentage (0–100). Stored as an int so the menu
+    /// events stay `Eq`; convert to a 0.0–1.0 amplitude with `amplitude()`.
+    #[serde(default = "default_volume_percent")]
+    pub volume_percent: u8,
+}
+
+fn default_volume_percent() -> u8 {
+    80
+}
+
+impl Settings {
+    /// Tone amplitude in the 0.0–1.0 range the audio code expects.
+    pub fn amplitude(&self) -> f32 {
+        self.volume_percent.min(100) as f32 / 100.0
+    }
 }
 
 impl Default for Settings {
@@ -25,6 +40,7 @@ impl Default for Settings {
             mode: Mode::Interval,
             interval_secs: 60,
             device_name: None,
+            volume_percent: default_volume_percent(),
         }
     }
 }

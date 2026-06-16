@@ -3,6 +3,8 @@
 mod audio;
 mod config;
 mod startup;
+#[cfg(windows)]
+mod winvol;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -25,12 +27,21 @@ const INTERVALS: &[(&str, u64)] = &[
     ("5 minutes", 300),
 ];
 
+const VOLUMES: &[(&str, u8)] = &[
+    ("20%", 20),
+    ("40%", 40),
+    ("60%", 60),
+    ("80%", 80),
+    ("100%", 100),
+];
+
 #[derive(Clone, Eq, PartialEq, Debug)]
 enum AppEvent {
     ToggleEnabled,
     ToggleStartup,
     SetMode(config::Mode),
     SetInterval(u64),
+    SetVolume(u8),
     SelectDevice(Option<usize>),
     RefreshDevices,
     PlayNow,
@@ -61,6 +72,12 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
             interval_menu.checkable(label, settings.interval_secs == *secs, AppEvent::SetInterval(*secs));
     }
 
+    let mut volume_menu = MenuBuilder::new();
+    for (label, pct) in VOLUMES {
+        volume_menu =
+            volume_menu.checkable(label, settings.volume_percent == *pct, AppEvent::SetVolume(*pct));
+    }
+
     let mut device_menu = MenuBuilder::new().checkable(
         "System Default",
         settings.device_name.is_none(),
@@ -77,6 +94,7 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
         .checkable("Start with Windows", startup::is_enabled(), AppEvent::ToggleStartup)
         .submenu("Mode", mode_menu)
         .submenu("Interval", interval_menu)
+        .submenu("Volume", volume_menu)
         .submenu("Output Device", device_menu)
         .separator()
         .item("Play tone now", AppEvent::PlayNow)
@@ -90,9 +108,9 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
 /// effect immediately rather than after the current tone/interval ends.
 fn scheduler_loop(shared: Arc<Shared>, nudge_rx: Receiver<()>) {
     loop {
-        let (enabled, mode, interval_secs, device_name) = {
+        let (enabled, mode, interval_secs, device_name, amplitude) = {
             let s = shared.settings.lock().unwrap();
-            (s.enabled, s.mode, s.interval_secs, s.device_name.clone())
+            (s.enabled, s.mode, s.interval_secs, s.device_name.clone(), s.amplitude())
         };
 
         if !enabled {
@@ -106,7 +124,7 @@ fn scheduler_loop(shared: Arc<Shared>, nudge_rx: Receiver<()>) {
             config::Mode::Interval => match nudge_rx.recv_timeout(Duration::from_secs(interval_secs)) {
                 Ok(()) => continue,
                 Err(RecvTimeoutError::Timeout) => {
-                    if let Err(err) = audio::play_tone(device_name.as_deref()) {
+                    if let Err(err) = audio::play_tone(device_name.as_deref(), amplitude) {
                         eprintln!("failed to play tone: {err}");
                     }
                 }
@@ -115,7 +133,7 @@ fn scheduler_loop(shared: Arc<Shared>, nudge_rx: Receiver<()>) {
             config::Mode::Continuous => {
                 // Returns as soon as a nudge arrives (settings changed) or
                 // the stream errors; either way we loop back and re-read.
-                if let Err(err) = audio::run_continuous(device_name.as_deref(), &nudge_rx) {
+                if let Err(err) = audio::run_continuous(device_name.as_deref(), amplitude, &nudge_rx) {
                     eprintln!("failed to start continuous tone: {err}");
                     if nudge_rx.recv_timeout(Duration::from_secs(5)) == Err(RecvTimeoutError::Disconnected) {
                         break;
@@ -196,6 +214,10 @@ impl ApplicationHandler<AppEvent> for App {
                 self.shared.settings.lock().unwrap().interval_secs = secs;
                 self.persist_and_refresh();
             }
+            AppEvent::SetVolume(pct) => {
+                self.shared.settings.lock().unwrap().volume_percent = pct;
+                self.persist_and_refresh();
+            }
             AppEvent::SelectDevice(idx) => {
                 let name = idx.and_then(|i| self.shared.devices.lock().unwrap().get(i).cloned());
                 self.shared.settings.lock().unwrap().device_name = name;
@@ -206,9 +228,12 @@ impl ApplicationHandler<AppEvent> for App {
                 self.refresh_menu();
             }
             AppEvent::PlayNow => {
-                let device_name = self.shared.settings.lock().unwrap().device_name.clone();
+                let (device_name, amplitude) = {
+                    let s = self.shared.settings.lock().unwrap();
+                    (s.device_name.clone(), s.amplitude())
+                };
                 std::thread::spawn(move || {
-                    if let Err(err) = audio::play_tone(device_name.as_deref()) {
+                    if let Err(err) = audio::play_tone(device_name.as_deref(), amplitude) {
                         eprintln!("failed to play tone: {err}");
                     }
                 });
