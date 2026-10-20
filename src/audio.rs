@@ -3,7 +3,6 @@ use cpal::{FromSample, SizedSample};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-const TONE_HZ: f32 = 50.0;
 const ONE_SHOT_DURATION: Duration = Duration::from_secs(3);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -36,26 +35,33 @@ fn resolve_device(host: &cpal::Host, device_name: Option<&str>) -> Result<cpal::
     }
 }
 
-/// Plays a short 50Hz tone once on the named device (or the system default
+/// Plays a short tone once on the named device (or the system default
 /// when `None`) at `amplitude` (0.0–1.0) and returns once it finishes.
-pub fn play_tone(device_name: Option<&str>, amplitude: f32) -> Result<(), String> {
-    with_tone_stream(device_name, amplitude, || {
+pub fn play_tone(
+    device_name: Option<&str>,
+    amplitude: f32,
+    frequency_hz: u16,
+) -> Result<(), String> {
+    with_tone_stream(device_name, amplitude, frequency_hz, || {
         std::thread::sleep(ONE_SHOT_DURATION);
         Ok(())
     })
 }
 
-/// Plays the 50Hz tone continuously (no gaps) at `amplitude` (0.0–1.0) until
+/// Plays the selected tone continuously (no gaps) at `amplitude` (0.0–1.0) until
 /// `stop_rx` receives anything or disconnects. Returns once playback stops.
 pub fn run_continuous(
     device_name: Option<&str>,
     amplitude: f32,
+    frequency_hz: u16,
     stop_rx: &Receiver<()>,
 ) -> Result<(), String> {
-    with_tone_stream(device_name, amplitude, || loop {
-        match stop_rx.recv_timeout(STOP_POLL_INTERVAL) {
-            Err(RecvTimeoutError::Timeout) => continue,
-            _ => return Ok(()),
+    with_tone_stream(device_name, amplitude, frequency_hz, || {
+        loop {
+            match stop_rx.recv_timeout(STOP_POLL_INTERVAL) {
+                Err(RecvTimeoutError::Timeout) => continue,
+                _ => return Ok(()),
+            }
         }
     })
 }
@@ -63,7 +69,12 @@ pub fn run_continuous(
 /// Opens the tone stream, starts it, forces this app's session to full volume,
 /// then runs `wait` until it returns. The stream stays alive (and audible) for
 /// the whole call and stops when it's dropped on return.
-fn with_tone_stream<F>(device_name: Option<&str>, amplitude: f32, wait: F) -> Result<(), String>
+fn with_tone_stream<F>(
+    device_name: Option<&str>,
+    amplitude: f32,
+    frequency_hz: u16,
+    wait: F,
+) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String>,
 {
@@ -71,9 +82,15 @@ where
     let device = resolve_device(&host, device_name)?;
     let config = device.default_output_config().map_err(|e| e.to_string())?;
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, config.into(), amplitude),
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, config.into(), amplitude),
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, config.into(), amplitude),
+        cpal::SampleFormat::F32 => {
+            build_stream::<f32>(&device, config.into(), amplitude, frequency_hz)
+        }
+        cpal::SampleFormat::I16 => {
+            build_stream::<i16>(&device, config.into(), amplitude, frequency_hz)
+        }
+        cpal::SampleFormat::U16 => {
+            build_stream::<u16>(&device, config.into(), amplitude, frequency_hz)
+        }
         other => Err(format!("unsupported sample format: {other:?}")),
     }?;
 
@@ -90,13 +107,15 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     amplitude: f32,
+    frequency_hz: u16,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
     let sample_rate = config.sample_rate as f32;
     let channels = config.channels as usize;
-    let phase_step = TONE_HZ / sample_rate;
+    let phase_step =
+        (frequency_hz as f32).clamp(20.0, (sample_rate / 2.0).min(20_000.0)) / sample_rate;
     let mut phase = 0f32;
 
     device

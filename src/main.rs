@@ -27,7 +27,23 @@ const INTERVALS: &[(&str, u64)] = &[
     ("5 minutes", 300),
 ];
 
+const FREQUENCIES: &[(&str, u16)] = &[
+    ("50 Hz (Low bass, original)", 50),
+    ("100 Hz (Bass)", 100),
+    ("250 Hz (Low-mid)", 250),
+    ("500 Hz (Mid)", 500),
+    ("1000 Hz (High-mid)", 1000),
+    ("2000 Hz (High)", 2000),
+];
+
 const VOLUMES: &[(&str, u8)] = &[
+    ("1%", 1),
+    ("2%", 2),
+    ("3%", 3),
+    ("4%", 4),
+    ("5%", 5),
+    ("10%", 10),
+    ("15%", 15),
     ("20%", 20),
     ("40%", 40),
     ("60%", 60),
@@ -42,6 +58,7 @@ enum AppEvent {
     SetMode(config::Mode),
     SetInterval(u64),
     SetVolume(u8),
+    SetFrequency(u16),
     SelectDevice(Option<usize>),
     RefreshDevices,
     PlayNow,
@@ -68,14 +85,29 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
 
     let mut interval_menu = MenuBuilder::new();
     for (label, secs) in INTERVALS {
-        interval_menu =
-            interval_menu.checkable(label, settings.interval_secs == *secs, AppEvent::SetInterval(*secs));
+        interval_menu = interval_menu.checkable(
+            label,
+            settings.interval_secs == *secs,
+            AppEvent::SetInterval(*secs),
+        );
     }
 
     let mut volume_menu = MenuBuilder::new();
     for (label, pct) in VOLUMES {
-        volume_menu =
-            volume_menu.checkable(label, settings.volume_percent == *pct, AppEvent::SetVolume(*pct));
+        volume_menu = volume_menu.checkable(
+            label,
+            settings.volume_percent == *pct,
+            AppEvent::SetVolume(*pct),
+        );
+    }
+
+    let mut frequency_menu = MenuBuilder::new();
+    for (label, hz) in FREQUENCIES {
+        frequency_menu = frequency_menu.checkable(
+            label,
+            settings.frequency_hz == *hz,
+            AppEvent::SetFrequency(*hz),
+        );
     }
 
     let mut device_menu = MenuBuilder::new().checkable(
@@ -85,16 +117,28 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
     );
     for (i, name) in devices.iter().enumerate() {
         let checked = settings.device_name.as_deref() == Some(name.as_str());
-        device_menu = device_menu.checkable(name.as_str(), checked, AppEvent::SelectDevice(Some(i)));
+        device_menu =
+            device_menu.checkable(name.as_str(), checked, AppEvent::SelectDevice(Some(i)));
     }
-    device_menu = device_menu.separator().item("Refresh device list", AppEvent::RefreshDevices);
+    device_menu = device_menu
+        .separator()
+        .item("Refresh device list", AppEvent::RefreshDevices);
 
     MenuBuilder::new()
-        .checkable("Keep Audio Alive", settings.enabled, AppEvent::ToggleEnabled)
-        .checkable("Start with Windows", startup::is_enabled(), AppEvent::ToggleStartup)
+        .checkable(
+            "Keep Audio Alive",
+            settings.enabled,
+            AppEvent::ToggleEnabled,
+        )
+        .checkable(
+            "Start with Windows",
+            startup::is_enabled(),
+            AppEvent::ToggleStartup,
+        )
         .submenu("Mode", mode_menu)
         .submenu("Interval", interval_menu)
         .submenu("Volume", volume_menu)
+        .submenu("Tone Frequency", frequency_menu)
         .submenu("Output Device", device_menu)
         .separator()
         .item("Play tone now", AppEvent::PlayNow)
@@ -108,9 +152,16 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
 /// effect immediately rather than after the current tone/interval ends.
 fn scheduler_loop(shared: Arc<Shared>, nudge_rx: Receiver<()>) {
     loop {
-        let (enabled, mode, interval_secs, device_name, amplitude) = {
+        let (enabled, mode, interval_secs, device_name, amplitude, frequency_hz) = {
             let s = shared.settings.lock().unwrap();
-            (s.enabled, s.mode, s.interval_secs, s.device_name.clone(), s.amplitude())
+            (
+                s.enabled,
+                s.mode,
+                s.interval_secs,
+                s.device_name.clone(),
+                s.amplitude(),
+                s.frequency_hz,
+            )
         };
 
         if !enabled {
@@ -121,21 +172,32 @@ fn scheduler_loop(shared: Arc<Shared>, nudge_rx: Receiver<()>) {
         }
 
         match mode {
-            config::Mode::Interval => match nudge_rx.recv_timeout(Duration::from_secs(interval_secs)) {
-                Ok(()) => continue,
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Err(err) = audio::play_tone(device_name.as_deref(), amplitude) {
-                        eprintln!("failed to play tone: {err}");
+            config::Mode::Interval => {
+                match nudge_rx.recv_timeout(Duration::from_secs(interval_secs)) {
+                    Ok(()) => continue,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Err(err) =
+                            audio::play_tone(device_name.as_deref(), amplitude, frequency_hz)
+                        {
+                            eprintln!("failed to play tone: {err}");
+                        }
                     }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
-            },
+            }
             config::Mode::Continuous => {
                 // Returns as soon as a nudge arrives (settings changed) or
                 // the stream errors; either way we loop back and re-read.
-                if let Err(err) = audio::run_continuous(device_name.as_deref(), amplitude, &nudge_rx) {
+                if let Err(err) = audio::run_continuous(
+                    device_name.as_deref(),
+                    amplitude,
+                    frequency_hz,
+                    &nudge_rx,
+                ) {
                     eprintln!("failed to start continuous tone: {err}");
-                    if nudge_rx.recv_timeout(Duration::from_secs(5)) == Err(RecvTimeoutError::Disconnected) {
+                    if nudge_rx.recv_timeout(Duration::from_secs(5))
+                        == Err(RecvTimeoutError::Disconnected)
+                    {
                         break;
                     }
                 }
@@ -163,7 +225,8 @@ impl App {
 
     fn refresh_icon(&mut self) {
         let enabled = self.shared.settings.lock().unwrap().enabled;
-        let icon = Icon::from_buffer(if enabled { ICON_ACTIVE } else { ICON_IDLE }, None, None).unwrap();
+        let icon =
+            Icon::from_buffer(if enabled { ICON_ACTIVE } else { ICON_IDLE }, None, None).unwrap();
         let _ = self.tray_icon.set_icon(&icon);
     }
 
@@ -218,6 +281,10 @@ impl ApplicationHandler<AppEvent> for App {
                 self.shared.settings.lock().unwrap().volume_percent = pct;
                 self.persist_and_refresh();
             }
+            AppEvent::SetFrequency(hz) => {
+                self.shared.settings.lock().unwrap().frequency_hz = hz;
+                self.persist_and_refresh();
+            }
             AppEvent::SelectDevice(idx) => {
                 let name = idx.and_then(|i| self.shared.devices.lock().unwrap().get(i).cloned());
                 self.shared.settings.lock().unwrap().device_name = name;
@@ -228,12 +295,14 @@ impl ApplicationHandler<AppEvent> for App {
                 self.refresh_menu();
             }
             AppEvent::PlayNow => {
-                let (device_name, amplitude) = {
+                let (device_name, amplitude, frequency_hz) = {
                     let s = self.shared.settings.lock().unwrap();
-                    (s.device_name.clone(), s.amplitude())
+                    (s.device_name.clone(), s.amplitude(), s.frequency_hz)
                 };
                 std::thread::spawn(move || {
-                    if let Err(err) = audio::play_tone(device_name.as_deref(), amplitude) {
+                    if let Err(err) =
+                        audio::play_tone(device_name.as_deref(), amplitude, frequency_hz)
+                    {
                         eprintln!("failed to play tone: {err}");
                     }
                 });
@@ -246,7 +315,11 @@ impl ApplicationHandler<AppEvent> for App {
 fn main() {
     let settings = config::load();
     let devices = audio::list_output_devices();
-    let initial_icon = if settings.enabled { ICON_ACTIVE } else { ICON_IDLE };
+    let initial_icon = if settings.enabled {
+        ICON_ACTIVE
+    } else {
+        ICON_IDLE
+    };
 
     let shared = Arc::new(Shared {
         settings: Mutex::new(settings.clone()),

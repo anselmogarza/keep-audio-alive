@@ -20,6 +20,13 @@ pub struct Settings {
     /// events stay `Eq`; convert to a 0.0–1.0 amplitude with `amplitude()`.
     #[serde(default = "default_volume_percent")]
     pub volume_percent: u8,
+    /// Tone frequency in Hz; older configurations retain 50 Hz.
+    #[serde(default = "default_frequency_hz")]
+    pub frequency_hz: u16,
+}
+
+fn default_frequency_hz() -> u16 {
+    50
 }
 
 fn default_volume_percent() -> u8 {
@@ -41,6 +48,7 @@ impl Default for Settings {
             interval_secs: 60,
             device_name: None,
             volume_percent: default_volume_percent(),
+            frequency_hz: default_frequency_hz(),
         }
     }
 }

@@ -1,13 +1,15 @@
 # Keep Audio Alive
 
 Windows tray app that prevents audio devices (soundbars, Bluetooth speakers,
-USB DACs, anything) from going idle. Periodically plays a short 50Hz tone on
+USB DACs, anything) from going idle. Periodically plays a short adjustable-frequency tone on
 the output device of your choice — not locked to one device or Bluetooth, pick
 any from the tray menu.
 
 ## Features
 
-- 50Hz tone with a selectable amplitude (20 / 40 / 60 / 80 / 100%, default 80%)
+- Selectable tone frequency: 50 / 100 / 250 / 500 / 1000 / 2000 Hz
+  from the tray's **Tone Frequency** menu (default 50 Hz)
+- Tone with a selectable amplitude (1 / 2 / 3 / 4 / 5 / 10 / 15 / 20 / 40 / 60 / 80 / 100%, default 80%)
   from the tray's **Volume** menu
 - Forces this app's own volume to 100% in the Windows Volume Mixer on each
   play, so the tone stays loud even if the app is turned down there — the
@@ -61,7 +63,9 @@ Both run per-user, no admin rights needed.
      (`HKCU\...\CurrentVersion\Run`, no admin needed)
    - **Mode** — Interval (periodic short tone) or Continuous (loops non-stop)
    - **Interval** — how often the tone plays (Interval mode only)
-   - **Volume** — tone amplitude (20–100%)
+   - **Tone Frequency** — choose a low, medium, or high tone (50–2000 Hz);
+     use **Play tone now** to preview your choice
+   - **Volume** — tone amplitude (1–100%)
    - **Output Device** — which device to target ("System Default" or any
      enumerated device; "Refresh device list" rescans after plugging
      something in)
@@ -71,7 +75,7 @@ Both run per-user, no admin rights needed.
 ## How it works
 
 A background thread sleeps for the configured interval, then opens a short
-output stream on the selected device and plays a 50Hz sine wave at the
+output stream on the selected device and plays a sine wave at the selected frequency and the
 amplitude chosen in the Volume menu — enough to keep the device's auto-sleep
 timer from firing. Right after starting playback it uses WASAPI's `ISimpleAudioVolume` to
 set this process's audio session to 100% (the per-app slider in the Windows
