@@ -3,6 +3,7 @@
 mod audio;
 mod config;
 mod startup;
+mod tone_ui;
 #[cfg(windows)]
 mod winvol;
 
@@ -27,37 +28,17 @@ const INTERVALS: &[(&str, u64)] = &[
     ("5 minutes", 300),
 ];
 
-const FREQUENCIES: &[(&str, u16)] = &[
-    ("50 Hz (Low bass, original)", 50),
-    ("100 Hz (Bass)", 100),
-    ("250 Hz (Low-mid)", 250),
-    ("500 Hz (Mid)", 500),
-    ("1000 Hz (High-mid)", 1000),
-    ("2000 Hz (High)", 2000),
-];
-
-const VOLUMES: &[(&str, u8)] = &[
-    ("1%", 1),
-    ("2%", 2),
-    ("3%", 3),
-    ("4%", 4),
-    ("5%", 5),
-    ("10%", 10),
-    ("15%", 15),
-    ("20%", 20),
-    ("40%", 40),
-    ("60%", 60),
-    ("80%", 80),
-    ("100%", 100),
-];
-
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 enum AppEvent {
     ToggleEnabled,
     ToggleStartup,
     SetMode(config::Mode),
     SetInterval(u64),
-    SetVolume(u8),
+    SetVolume(f32),
+    OpenToneSettings,
+    SetMixer(bool),
+    SetMuted(bool),
+    Preview(bool),
     SetFrequency(u16),
     SelectDevice(Option<usize>),
     RefreshDevices,
@@ -66,7 +47,10 @@ enum AppEvent {
 }
 
 struct Shared {
-    settings: Mutex<config::Settings>,
+    settings: Arc<Mutex<config::Settings>>,
+    preview: std::sync::atomic::AtomicBool,
+    one_shot: std::sync::atomic::AtomicBool,
+    quitting: std::sync::atomic::AtomicBool,
     devices: Mutex<Vec<String>>,
 }
 
@@ -89,24 +73,6 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
             label,
             settings.interval_secs == *secs,
             AppEvent::SetInterval(*secs),
-        );
-    }
-
-    let mut volume_menu = MenuBuilder::new();
-    for (label, pct) in VOLUMES {
-        volume_menu = volume_menu.checkable(
-            label,
-            settings.volume_percent == *pct,
-            AppEvent::SetVolume(*pct),
-        );
-    }
-
-    let mut frequency_menu = MenuBuilder::new();
-    for (label, hz) in FREQUENCIES {
-        frequency_menu = frequency_menu.checkable(
-            label,
-            settings.frequency_hz == *hz,
-            AppEvent::SetFrequency(*hz),
         );
     }
 
@@ -137,8 +103,7 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
         )
         .submenu("Mode", mode_menu)
         .submenu("Interval", interval_menu)
-        .submenu("Volume", volume_menu)
-        .submenu("Tone Frequency", frequency_menu)
+        .item("Tone settings...", AppEvent::OpenToneSettings)
         .submenu("Output Device", device_menu)
         .separator()
         .item("Play tone now", AppEvent::PlayNow)
@@ -152,16 +117,21 @@ fn build_menu(settings: &config::Settings, devices: &[String]) -> MenuBuilder<Ap
 /// effect immediately rather than after the current tone/interval ends.
 fn scheduler_loop(shared: Arc<Shared>, nudge_rx: Receiver<()>) {
     loop {
-        let (enabled, mode, interval_secs, device_name, amplitude, frequency_hz) = {
+        use std::sync::atomic::Ordering::Relaxed;
+        if shared.quitting.load(Relaxed) {
+            break;
+        }
+        if shared.preview.load(Relaxed) || shared.one_shot.swap(false, Relaxed) {
+            let preview = shared.preview.load(Relaxed);
+            if let Err(err) = audio::play(shared.settings.clone(), &nudge_rx, preview) {
+                shared.preview.store(false, Relaxed);
+                tone_ui::show_error(&err);
+            }
+            continue;
+        }
+        let (enabled, mode, interval_secs) = {
             let s = shared.settings.lock().unwrap();
-            (
-                s.enabled,
-                s.mode,
-                s.interval_secs,
-                s.device_name.clone(),
-                s.amplitude(),
-                s.frequency_hz,
-            )
+            (s.enabled, s.mode, s.interval_secs)
         };
 
         if !enabled {
@@ -176,9 +146,7 @@ fn scheduler_loop(shared: Arc<Shared>, nudge_rx: Receiver<()>) {
                 match nudge_rx.recv_timeout(Duration::from_secs(interval_secs)) {
                     Ok(()) => continue,
                     Err(RecvTimeoutError::Timeout) => {
-                        if let Err(err) =
-                            audio::play_tone(device_name.as_deref(), amplitude, frequency_hz)
-                        {
+                        if let Err(err) = audio::play(shared.settings.clone(), &nudge_rx, false) {
                             eprintln!("failed to play tone: {err}");
                         }
                     }
@@ -188,12 +156,7 @@ fn scheduler_loop(shared: Arc<Shared>, nudge_rx: Receiver<()>) {
             config::Mode::Continuous => {
                 // Returns as soon as a nudge arrives (settings changed) or
                 // the stream errors; either way we loop back and re-read.
-                if let Err(err) = audio::run_continuous(
-                    device_name.as_deref(),
-                    amplitude,
-                    frequency_hz,
-                    &nudge_rx,
-                ) {
+                if let Err(err) = audio::play(shared.settings.clone(), &nudge_rx, true) {
                     eprintln!("failed to start continuous tone: {err}");
                     if nudge_rx.recv_timeout(Duration::from_secs(5))
                         == Err(RecvTimeoutError::Disconnected)
@@ -211,6 +174,8 @@ struct App {
     tray_icon: TrayIcon<AppEvent>,
     shared: Arc<Shared>,
     nudge: Sender<()>,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    tone_window: Option<std::thread::JoinHandle<()>>,
 }
 
 impl App {
@@ -279,11 +244,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::SetVolume(pct) => {
                 self.shared.settings.lock().unwrap().volume_percent = pct;
-                self.persist_and_refresh();
+                config::save(&self.shared.settings.lock().unwrap());
             }
             AppEvent::SetFrequency(hz) => {
                 self.shared.settings.lock().unwrap().frequency_hz = hz;
-                self.persist_and_refresh();
+                config::save(&self.shared.settings.lock().unwrap());
             }
             AppEvent::SelectDevice(idx) => {
                 let name = idx.and_then(|i| self.shared.devices.lock().unwrap().get(i).cloned());
@@ -294,18 +259,41 @@ impl ApplicationHandler<AppEvent> for App {
                 *self.shared.devices.lock().unwrap() = audio::list_output_devices();
                 self.refresh_menu();
             }
+            AppEvent::OpenToneSettings => {
+                if !tone_ui::focus_existing()
+                    && self.tone_window.as_ref().is_none_or(|t| t.is_finished())
+                {
+                    let settings = self.shared.settings.lock().unwrap().clone();
+                    let proxy = self.proxy.clone();
+                    self.tone_window =
+                        Some(std::thread::spawn(move || tone_ui::show(settings, proxy)));
+                }
+            }
+            AppEvent::SetMuted(value) => {
+                self.shared.settings.lock().unwrap().muted = value;
+                config::save(&self.shared.settings.lock().unwrap());
+            }
+            AppEvent::SetMixer(value) => {
+                self.shared.settings.lock().unwrap().force_mixer_volume = value;
+                self.persist_and_refresh();
+            }
+            AppEvent::Preview(on) => {
+                self.shared
+                    .preview
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+                let _ = self.nudge.send(());
+            }
             AppEvent::PlayNow => {
-                let (device_name, amplitude, frequency_hz) = {
-                    let s = self.shared.settings.lock().unwrap();
-                    (s.device_name.clone(), s.amplitude(), s.frequency_hz)
-                };
-                std::thread::spawn(move || {
-                    if let Err(err) =
-                        audio::play_tone(device_name.as_deref(), amplitude, frequency_hz)
-                    {
-                        eprintln!("failed to play tone: {err}");
-                    }
-                });
+                if !self
+                    .shared
+                    .preview
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.shared
+                        .one_shot
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = self.nudge.send(());
+                }
             }
             AppEvent::Quit => event_loop.exit(),
         }
@@ -322,22 +310,27 @@ fn main() {
     };
 
     let shared = Arc::new(Shared {
-        settings: Mutex::new(settings.clone()),
+        settings: Arc::new(Mutex::new(settings.clone())),
+        preview: std::sync::atomic::AtomicBool::new(false),
+        one_shot: std::sync::atomic::AtomicBool::new(false),
+        quitting: std::sync::atomic::AtomicBool::new(false),
         devices: Mutex::new(devices.clone()),
     });
 
     let (nudge_tx, nudge_rx) = std::sync::mpsc::channel();
-    {
-        let shared = Arc::clone(&shared);
-        std::thread::spawn(move || scheduler_loop(shared, nudge_rx));
-    }
+    let playback_shared = shared.clone();
+    let scheduler = std::thread::spawn(move || scheduler_loop(playback_shared, nudge_rx));
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
+    if std::env::args().any(|arg| arg == "--tone-settings") {
+        let _ = proxy.send_event(AppEvent::OpenToneSettings);
+    }
 
+    let tray_proxy = proxy.clone();
     let tray_icon = TrayIconBuilder::new()
         .sender(move |event: &AppEvent| {
-            let _ = proxy.send_event(event.clone());
+            let _ = tray_proxy.send_event(event.clone());
         })
         .icon_from_buffer(initial_icon)
         .tooltip("Keep Audio Alive")
@@ -348,8 +341,15 @@ fn main() {
     let mut app = App {
         window: None,
         tray_icon,
-        shared,
-        nudge: nudge_tx,
+        shared: shared.clone(),
+        nudge: nudge_tx.clone(),
+        proxy,
+        tone_window: None,
     };
     event_loop.run_app(&mut app).expect("event loop error");
+    shared
+        .quitting
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = nudge_tx.send(());
+    let _ = scheduler.join();
 }

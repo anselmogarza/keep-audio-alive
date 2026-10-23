@@ -1,85 +1,60 @@
 # Keep Audio Alive
 
-Windows tray app that prevents audio devices (soundbars, Bluetooth speakers,
-USB DACs, anything) from going idle. Periodically plays a short adjustable-frequency tone on
-the output device of your choice — not locked to one device or Bluetooth, pick
-any from the tray menu.
+Windows tray app that prevents audio devices from going idle by playing an adjustable sine wave on your selected output device.
 
 ## Features
 
-- Selectable tone frequency: 50 / 100 / 250 / 500 / 1000 / 2000 Hz
-  from the tray's **Tone Frequency** menu (default 50 Hz)
-- Tone with a selectable amplitude (1 / 2 / 3 / 4 / 5 / 10 / 15 / 20 / 40 / 60 / 80 / 100%, default 80%)
-  from the tray's **Volume** menu
-- Forces this app's own volume to 100% in the Windows Volume Mixer on each
-  play, so the tone stays loud even if the app is turned down there — the
-  master volume and other apps are left untouched
-- Two modes:
-  - **Interval** — short 3s tone every 30s / 1m / 2m / 5m
-  - **Continuous** — loops the tone with no gaps until you turn it off
-- Pick the output device from a live list, or use the system default
-- "Start with Windows" toggle (per-user registry Run key, no admin needed)
-- Settings persisted to `%APPDATA%\KeepAudioAlive\config.json`
-- Lives entirely in the system tray, no window
+- **Tone settings...** opens a small native Windows window:
+  - Frequency slider: **20-20,000 Hz**, logarithmic spacing, with an exact whole-Hz input.
+  - Volume slider: **0.01-100%**, logarithmic spacing, with an exact fractional-percentage input (for example, **0.05%**).
+  - Sliders apply immediately. Use arrow keys for smaller adjustments. Click **Apply exact values** after typing numbers.
+  - Separate **Mute tone** checkbox preserves the selected volume.
+  - **Start preview / Stop preview** for continuous tuning on the selected output device. Preview temporarily replaces scheduled playback; stopping it or closing the window resumes the configured mode.
+  - Optional **Set this app's Windows mixer volume to 100%**. Enabled by default to preserve existing behavior; disabling it leaves the current mixer level alone. It does not restore a previous mixer value.
+- Smooth frequency and amplitude changes, with short fades at playback start and stop.
+- **Interval** mode: a three-second tone every 30 seconds / 1 minute / 2 minutes / 5 minutes.
+- **Continuous** mode: an uninterrupted tone until disabled.
+- Select any available output device, or use the system default.
+- **Start with Windows** toggle (per-user registry Run key, no admin needed).
+- Settings persist in `%APPDATA%\KeepAudioAlive\config.json`. Existing configurations, including integer volumes, are preserved. Defaults remain 50 Hz and 80% amplitude.
+- Lives in the system tray; settings are shown only when requested.
 
-## Build (cross-compiled from macOS)
+## Finding a quiet setting
 
-Requires the Windows GNU target and a mingw-w64 linker:
+Open **Tone settings...** from the tray menu, enter a low volume such as **0.1%**, click **Apply exact values**, then **Start preview**. Adjust frequency and volume while listening. **Stop preview** returns to your configured playback mode. Leave the app running longer than your monitors' usual idle timeout to check whether the chosen setting keeps them awake. Mute produces silence and may not prevent a device from sleeping.
 
-```bash
-rustup target add x86_64-pc-windows-gnu
-brew install mingw-w64
+The percentage controls the generated signal's amplitude, not a measured sound level. The Windows mixer, master volume, output format, and monitor hardware also affect the result. Very small amplitudes may be rounded away by an output device. Frequencies above the selected device's usable sample-rate limit are capped internally.
 
-cargo build --release --target x86_64-pc-windows-gnu
+## Build on Windows (GNU toolchain)
+
+Requires Rust's `stable-x86_64-pc-windows-gnu` toolchain and MinGW-w64 GCC. For an MSYS2 UCRT64 installation:
+
+```powershell
+$env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
+cargo +stable-x86_64-pc-windows-gnu test --locked --target x86_64-pc-windows-gnu
+cargo +stable-x86_64-pc-windows-gnu build --release --locked --target x86_64-pc-windows-gnu
 ```
 
-Output: `target/x86_64-pc-windows-gnu/release/keep-audio-alive.exe`
+Output: `target/x86_64-pc-windows-gnu/release/keep-audio-alive.exe`.
 
-Copy that single `.exe` to a Windows machine and run it — no runtime install
-needed.
+You can also build using the MSVC Rust toolchain with Visual Studio C++ Build Tools installed, using `cargo build --release`.
 
 ## Install (optional)
 
-There's no MSI/EXE installer (building one needs WiX/NSIS, which are
-Windows-only tools — can't produce them from this macOS box). Instead,
-`scripts/install.ps1` does what an installer would: copies the `.exe` to
-`%LOCALAPPDATA%\KeepAudioAlive\`, adds a Start Menu shortcut, enables autostart
-on login, and launches it. Run it from the same folder as the built `.exe`:
+Place `scripts/install.ps1` alongside the built `.exe`, then run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-`scripts/uninstall.ps1` reverses it (stops the app, removes the shortcut,
-install dir, and the "run on login" registry entry — settings are kept).
-Both run per-user, no admin rights needed.
+The script copies the executable to `%LOCALAPPDATA%\KeepAudioAlive\`, creates a Start Menu shortcut, enables autostart, and launches the app. `scripts/uninstall.ps1` reverses the installation, keeping settings. Both run per-user without administrator rights.
 
-## Usage
+## Tray menu
 
-1. Launch the `.exe`; a speaker icon appears in the system tray
-2. Right-click (or left-click) for the menu:
-   - **Keep Audio Alive** — toggle on/off
-   - **Start with Windows** — registers/unregisters launch on login
-     (`HKCU\...\CurrentVersion\Run`, no admin needed)
-   - **Mode** — Interval (periodic short tone) or Continuous (loops non-stop)
-   - **Interval** — how often the tone plays (Interval mode only)
-   - **Tone Frequency** — choose a low, medium, or high tone (50–2000 Hz);
-     use **Play tone now** to preview your choice
-   - **Volume** — tone amplitude (1–100%)
-   - **Output Device** — which device to target ("System Default" or any
-     enumerated device; "Refresh device list" rescans after plugging
-     something in)
-   - **Play tone now** — trigger immediately, e.g. to test a device
-   - **Quit**
-
-## How it works
-
-A background thread sleeps for the configured interval, then opens a short
-output stream on the selected device and plays a sine wave at the selected frequency and the
-amplitude chosen in the Volume menu — enough to keep the device's auto-sleep
-timer from firing. Right after starting playback it uses WASAPI's `ISimpleAudioVolume` to
-set this process's audio session to 100% (the per-app slider in the Windows
-Volume Mixer), so the tone plays as loud as the master volume allows even when
-the app has been turned down in the mixer. Only this app's session is changed —
-the master/endpoint volume and every other app are left as they are, so a low
-master volume still scales the tone down proportionally.
+- **Keep Audio Alive**: enable or disable scheduled playback.
+- **Start with Windows**: toggle autostart.
+- **Mode / Interval**: configure continuous or periodic playback.
+- **Tone settings...**: adjust frequency and volume, mute, and preview.
+- **Output Device**: choose a device; refresh the list after plugging one in. Device or mixer-override changes take effect by reopening active playback.
+- **Play tone now**: play a three-second test without overlapping other playback; continuous preview already plays the tone.
+- **Quit**: stop playback and exit.

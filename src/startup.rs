@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "KeepAudioAlive";
@@ -27,7 +27,8 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
         let path = exe_path()?;
         let command = format!("\"{}\"", path.display());
-        key.set_value(VALUE_NAME, &command).map_err(|e| e.to_string())
+        key.set_value(VALUE_NAME, &command)
+            .map_err(|e| e.to_string())
     } else {
         match key.delete_value(VALUE_NAME) {
             Ok(()) => Ok(()),

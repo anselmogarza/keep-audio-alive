@@ -9,15 +9,15 @@
 
 use std::ptr;
 
-use windows::core::Result;
 use windows::Win32::Foundation::FALSE;
 use windows::Win32::Media::Audio::{
-    eRender, IAudioSessionManager, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
-    DEVICE_STATE_ACTIVE,
+    DEVICE_STATE_ACTIVE, IAudioSessionManager, IMMDeviceEnumerator, ISimpleAudioVolume,
+    MMDeviceEnumerator, eRender,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
+use windows::core::Result;
 
 /// Pins this process's audio session to 100% (and unmutes it) on every active
 /// render endpoint. Best-effort: logs and moves on if anything fails, since a

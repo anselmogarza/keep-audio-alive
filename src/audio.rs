@@ -1,134 +1,100 @@
+use crate::config::Settings;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, mpsc::Receiver};
 use std::time::Duration;
 
-const ONE_SHOT_DURATION: Duration = Duration::from_secs(3);
-const STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Names of every available output device, in enumeration order.
-/// The index into this list is what `Settings::device_name` resolves through.
 pub fn list_output_devices() -> Vec<String> {
-    let host = cpal::default_host();
-    host.output_devices()
+    cpal::default_host()
+        .output_devices()
         .map(|devs| {
-            devs.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+            devs.filter_map(|d| d.description().ok().map(|v| v.name().to_string()))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn resolve_device(host: &cpal::Host, device_name: Option<&str>) -> Result<cpal::Device, String> {
-    match device_name {
+pub fn play(
+    settings: Arc<Mutex<Settings>>,
+    stop: &Receiver<()>,
+    continuous: bool,
+) -> Result<(), String> {
+    let host = cpal::default_host();
+    let initial = settings.lock().unwrap().clone();
+    let device = match initial.device_name.as_deref() {
         Some(name) => host
             .output_devices()
             .map_err(|e| e.to_string())?
-            .find(|d| {
-                d.description()
-                    .map(|desc| desc.name() == name)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| format!("output device '{name}' not found")),
+            .find(|d| d.description().map(|v| v.name() == name).unwrap_or(false))
+            .ok_or_else(|| format!("output device '{name}' not found"))?,
         None => host
             .default_output_device()
-            .ok_or_else(|| "no default output device".to_string()),
-    }
-}
-
-/// Plays a short tone once on the named device (or the system default
-/// when `None`) at `amplitude` (0.0–1.0) and returns once it finishes.
-pub fn play_tone(
-    device_name: Option<&str>,
-    amplitude: f32,
-    frequency_hz: u16,
-) -> Result<(), String> {
-    with_tone_stream(device_name, amplitude, frequency_hz, || {
-        std::thread::sleep(ONE_SHOT_DURATION);
-        Ok(())
-    })
-}
-
-/// Plays the selected tone continuously (no gaps) at `amplitude` (0.0–1.0) until
-/// `stop_rx` receives anything or disconnects. Returns once playback stops.
-pub fn run_continuous(
-    device_name: Option<&str>,
-    amplitude: f32,
-    frequency_hz: u16,
-    stop_rx: &Receiver<()>,
-) -> Result<(), String> {
-    with_tone_stream(device_name, amplitude, frequency_hz, || {
-        loop {
-            match stop_rx.recv_timeout(STOP_POLL_INTERVAL) {
-                Err(RecvTimeoutError::Timeout) => continue,
-                _ => return Ok(()),
-            }
-        }
-    })
-}
-
-/// Opens the tone stream, starts it, forces this app's session to full volume,
-/// then runs `wait` until it returns. The stream stays alive (and audible) for
-/// the whole call and stops when it's dropped on return.
-fn with_tone_stream<F>(
-    device_name: Option<&str>,
-    amplitude: f32,
-    frequency_hz: u16,
-    wait: F,
-) -> Result<(), String>
-where
-    F: FnOnce() -> Result<(), String>,
-{
-    let host = cpal::default_host();
-    let device = resolve_device(&host, device_name)?;
+            .ok_or("no default output device")?,
+    };
     let config = device.default_output_config().map_err(|e| e.to_string())?;
+    let fading_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
-            build_stream::<f32>(&device, config.into(), amplitude, frequency_hz)
+            build::<f32>(&device, config.into(), settings, fading_out.clone())
         }
         cpal::SampleFormat::I16 => {
-            build_stream::<i16>(&device, config.into(), amplitude, frequency_hz)
+            build::<i16>(&device, config.into(), settings, fading_out.clone())
         }
         cpal::SampleFormat::U16 => {
-            build_stream::<u16>(&device, config.into(), amplitude, frequency_hz)
+            build::<u16>(&device, config.into(), settings, fading_out.clone())
         }
         other => Err(format!("unsupported sample format: {other:?}")),
     }?;
-
     stream.play().map_err(|e| e.to_string())?;
-    // Playing creates this process's audio session; now pin it to 100% so the
-    // tone is at full level regardless of where the app sits in the mixer.
     #[cfg(windows)]
-    crate::winvol::force_app_volume_max();
-
-    wait()
+    if initial.force_mixer_volume {
+        crate::winvol::force_app_volume_max();
+    }
+    if continuous {
+        let _ = stop.recv();
+    } else {
+        let _ = stop.recv_timeout(Duration::from_secs(3));
+    }
+    fading_out.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(40));
+    drop(stream);
+    Ok(())
 }
 
-fn build_stream<T>(
+fn build<T: SizedSample + FromSample<f32>>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
-    amplitude: f32,
-    frequency_hz: u16,
-) -> Result<cpal::Stream, String>
-where
-    T: SizedSample + FromSample<f32>,
-{
+    settings: Arc<Mutex<Settings>>,
+    fading_out: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<cpal::Stream, String> {
     let sample_rate = config.sample_rate as f32;
     let channels = config.channels as usize;
-    let phase_step =
-        (frequency_hz as f32).clamp(20.0, (sample_rate / 2.0).min(20_000.0)) / sample_rate;
-    let mut phase = 0f32;
-
+    let mut phase = 0.0_f32;
+    let mut amplitude = 0.0_f32;
+    let mut frequency = settings.lock().unwrap().frequency_hz as f32;
+    // A 5ms time constant smooths changes; the 40ms tail lets stop fades settle.
+    let smoothing = 1.0 - (-1.0 / (0.005 * sample_rate)).exp();
+    let mut target_amplitude = 0.0;
+    let mut target_frequency = frequency;
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
+                // Never block the audio callback on UI or configuration writes.
+                if let Ok(s) = settings.try_lock() {
+                    target_amplitude = s.amplitude();
+                    target_frequency =
+                        (s.frequency_hz as f32).clamp(20.0, (sample_rate * 0.49).min(20_000.0));
+                }
+                if fading_out.load(std::sync::atomic::Ordering::Relaxed) {
+                    target_amplitude = 0.0;
+                }
                 for frame in data.chunks_mut(channels) {
-                    let sample = (phase * std::f32::consts::TAU).sin() * amplitude;
-                    phase = (phase + phase_step).fract();
-                    let value = T::from_sample(sample);
-                    for slot in frame.iter_mut() {
-                        *slot = value;
-                    }
+                    amplitude += (target_amplitude - amplitude) * smoothing;
+                    frequency += (target_frequency - frequency) * smoothing;
+                    let value = T::from_sample((phase * std::f32::consts::TAU).sin() * amplitude);
+                    phase = (phase + frequency / sample_rate).fract();
+                    frame.fill(value);
                 }
             },
             |err| eprintln!("audio stream error: {err}"),
